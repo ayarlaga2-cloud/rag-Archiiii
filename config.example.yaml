@@ -1,0 +1,203 @@
+# ===========================================================================
+# Runbook RAG — configuration TEMPLATE
+#
+#     copy config.example.yaml config.yaml      (Windows)
+#     cp   config.example.yaml config.yaml      (macOS / Linux)
+#
+# then fill in config.yaml. THIS file is committed, so never put real
+# credentials in it — config.yaml is gitignored and is where they belong.
+#
+# Everything lives in one file: connection details, credentials, models,
+# chunking, retrieval tuning.
+#
+# Precedence:  environment variable  >  this file  >  built-in default
+# (Env vars still work, which is what CI should use instead of a checked-in
+# file. Nothing here requires them.)
+#
+# Switching models is a one-line change: set `embedding.active` to any key
+# under `embedding.profiles`. Same pattern for vector_store and reranker.
+# Override for a single command without editing anything:
+#
+#     triage --embedding-profile bge-small search "..."
+#     triage --store-profile production stats
+#
+# Inspect what actually resolved:  triage config
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Where the runbooks come from
+# ---------------------------------------------------------------------------
+confluence:
+  # Your Confluence site. MUST include the /wiki suffix on Confluence Cloud:
+  #   correct:  https://acme.atlassian.net/wiki
+  #   wrong:    https://acme.atlassian.net
+  base_url: ""
+
+  # The Atlassian account email the API token belongs to. Must be the SAME
+  # account that created the token below, or auth returns 401.
+  email: ""
+
+  # Create at: https://id.atlassian.com/manage-profile/security/api-tokens
+  # "Create API token" -> label it -> copy immediately; Atlassian will not
+  # show the value again.
+  api_token: ""
+
+  # Selection is CQL. These compose into:
+  #   type = page AND space in ("SRE") AND label in ("runbook")
+  # Empty list disables that filter.
+  space_keys: ["SRE", "PLATFORM"]
+  labels: ["runbook"]
+  # Set this to take full manual control; it overrides space_keys/labels.
+  cql: ""
+
+  page_size: 50
+  timeout_seconds: 45
+
+# ---------------------------------------------------------------------------
+# Embeddings — change `active` to switch model
+# ---------------------------------------------------------------------------
+embedding:
+  active: gemma
+
+  # --- credentials used by the profiles below ---
+  # EmbeddingGemma is a GATED model. Two steps:
+  #   1. Accept the licence: https://huggingface.co/google/embeddinggemma-300m
+  #   2. Create a READ token: https://huggingface.co/settings/tokens
+  # Alternatively run `huggingface-cli login` once and leave this blank.
+  hf_token: ""
+
+  # Only needed by the `voyage` embedding profile and the `voyage` reranker
+  # profile. https://dash.voyageai.com/api-keys
+  voyage_api_key: ""
+
+  profiles:
+    # Default. 308M params, 768 dims, 2048-token window, CPU-viable.
+    # GATED MODEL: accept the licence at
+    #   https://huggingface.co/google/embeddinggemma-300m
+    # then `huggingface-cli login`, or set `hf_token` above.
+    gemma:
+      provider: gemma
+      model: "google/embeddinggemma-300m"
+      batch_size: 16
+      truncate_dim: null    # Matryoshka: null (768) | 512 | 256 | 128
+      device: ""            # "" autodetects | cpu | cuda | mps
+
+    # Same model, quarter-size index. Measure against your eval set before
+    # adopting — the accuracy cost is real but usually small.
+    gemma-256:
+      provider: gemma
+      model: "google/embeddinggemma-300m"
+      batch_size: 16
+      truncate_dim: 256
+      device: ""
+
+    # Lighter alternative, no gated-model login required. 384 dims.
+    bge-small:
+      provider: sentence-transformers
+      model: "BAAI/bge-small-en-v1.5"
+      batch_size: 32
+      device: ""
+
+    # Hosted API — no local model, no torch install.
+    voyage:
+      provider: voyage
+      model: "voyage-3"      # key: embedding.voyage_api_key above
+      batch_size: 64
+
+    # Dependency-free. Runs the whole pipeline on numpy alone so you can
+    # verify wiring before downloading 2 GB. Retrieval quality is poor —
+    # smoke tests only, never ship it.
+    hashing:
+      provider: hashing
+      model: "hashing-384"
+
+# ---------------------------------------------------------------------------
+# Vector store — `local` to start, `production` when you outgrow it
+# ---------------------------------------------------------------------------
+vector_store:
+  active: local
+
+  profiles:
+    local:
+      backend: chroma
+      collection: runbooks
+      path: "./data/chroma"
+
+    # Postgres + pgvector. Adds concurrent writers, real backups, and native
+    # full-text search — which moves the lexical half of hybrid retrieval into
+    # the database instead of an in-process BM25 sidecar.
+    # Requires: CREATE EXTENSION vector;
+    production:
+      backend: pgvector
+      collection: runbooks
+      # postgresql://user:password@host:5432/dbname
+      dsn: ""
+
+# ---------------------------------------------------------------------------
+# Chunking — see docs/CHUNKING.md before changing these
+# ---------------------------------------------------------------------------
+chunking:
+  # EmbeddingGemma accepts 2048, but a chunk that large averages several
+  # topics into one vector and loses precision. 512 keeps roughly one
+  # procedure per vector. Raise toward 1024 only for prose-heavy pages.
+  max_tokens: 512
+  # Trailing chunks below this merge into their neighbour, so you don't get
+  # 12-token orphans that retrieve noisily and say nothing.
+  min_tokens: 96
+  # ~12% of max. Structural boundaries already fall in sensible places, so
+  # heavy overlap mostly buys duplicate storage.
+  overlap_tokens: 64
+
+# ---------------------------------------------------------------------------
+# Retrieval
+# ---------------------------------------------------------------------------
+retrieval:
+  dense_k: 30        # candidates from vector search
+  lexical_k: 30      # candidates from BM25 / Postgres FTS
+  fused_k: 20        # survivors of RRF, fed to the reranker
+  final_k: 6         # returned to the caller
+  rrf_k: 60          # RRF constant; higher flattens the top ranks
+
+  # Raise lexical_weight if your corpus is identifier-heavy (stack traces,
+  # error codes); raise dense_weight if queries are mostly paraphrase.
+  dense_weight: 1.0
+  lexical_weight: 1.0
+
+  # Expand each hit to its whole section, so retrieving step 4 of 8 returns
+  # all eight. Leave on for runbooks.
+  expand_section: true
+
+# ---------------------------------------------------------------------------
+# Reranking — usually the single largest quality gain. Off by default so
+# nothing extra downloads before you ask for it.
+# ---------------------------------------------------------------------------
+reranker:
+  active: none
+
+  profiles:
+    none:
+      provider: none
+
+    # Cross-encoder: reads query and document jointly instead of comparing two
+    # independent summaries. Runs over the ~20 fusion survivors, not the corpus.
+    local:
+      provider: local
+      model: "BAAI/bge-reranker-base"
+
+    voyage:
+      provider: voyage
+      model: "rerank-2"    # key: embedding.voyage_api_key above
+
+# ---------------------------------------------------------------------------
+# Service + misc
+# ---------------------------------------------------------------------------
+service:
+  host: "127.0.0.1"
+  port: 8080
+
+logging:
+  level: INFO       # DEBUG | INFO | WARNING | ERROR
+  json: false       # true in production, for log aggregation
+
+paths:
+  data_dir: "./data"

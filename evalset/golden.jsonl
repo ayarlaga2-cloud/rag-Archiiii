@@ -1,0 +1,21 @@
+# Golden set for retrieval evaluation.
+# One JSON object per line. Lines starting with # are ignored.
+#
+#   query            free text, as an on-call would actually type it
+#   relevant_pages   page titles (or page ids) that SHOULD be retrieved
+#   relevant_sections optional breadcrumb substring to require
+#   notes            why this case exists — read this when it fails
+#
+# Deliberately mixes three query styles, because they stress different halves
+# of hybrid retrieval:
+#   * exact identifiers   -> BM25 should nail these
+#   * paraphrase          -> only dense retrieval can catch these
+#   * intent-scoped       -> tests section classification
+{"query": "org.postgresql.util.PSQLException: FATAL: sorry, too many clients already", "relevant_pages": ["Postgres Connection Exhaustion"], "notes": "exact identifier - BM25 must hit this"}
+{"query": "checkout is returning 503 and the database is refusing new connections", "relevant_pages": ["Postgres Connection Exhaustion"], "notes": "paraphrase, no identifiers - dense retrieval carries this"}
+{"query": "how do I roll back checkout-api", "relevant_pages": ["Postgres Connection Exhaustion"], "relevant_sections": ["Rollback"], "notes": "intent-scoped - should land on the Rollback section"}
+{"query": "pgbouncer cl_waiting rising sv_idle zero", "relevant_pages": ["Postgres Connection Exhaustion"], "notes": "metric names as identifiers"}
+{"query": "order history page showing stale data", "relevant_pages": ["Kafka Consumer Lag on order-events"], "notes": "symptom described from the user's side, not the system's"}
+{"query": "CommitFailedException repeated rebalances consumer group", "relevant_pages": ["Kafka Consumer Lag on order-events"], "notes": "exception class + symptom"}
+{"query": "how many replicas can I scale order-projector to", "relevant_pages": ["Kafka Consumer Lag on order-events"], "relevant_sections": ["Remediation"], "notes": "answer is a constraint buried in a step - tests that steps stay whole"}
+{"query": "is it safe to reset kafka offsets", "relevant_pages": ["Kafka Consumer Lag on order-events"], "notes": "should surface the CAUTION panel, tests panel preservation"}

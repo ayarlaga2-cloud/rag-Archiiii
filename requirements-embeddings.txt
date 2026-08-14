@@ -1,0 +1,20 @@
+# EmbeddingGemma (google/embeddinggemma-300m) and any other
+# sentence-transformers model, plus the optional local cross-encoder reranker.
+#
+#   pip install -r requirements-embeddings.txt
+#
+# EmbeddingGemma needs sentence-transformers >= 5.0 (for encode_query /
+# encode_document) and transformers >= 4.56 (for the Gemma3 text encoder).
+#
+# It is a GATED model: accept the licence at
+#   https://huggingface.co/google/embeddinggemma-300m
+# then `huggingface-cli login`, or set HF_TOKEN in .env.
+#
+# Pulls torch (~2 GB). To verify the pipeline before downloading anything,
+# set EMBEDDING_PROVIDER=hashing — the full ingest/retrieval path runs with
+# numpy alone (retrieval quality is poor; smoke tests only).
+
+sentence-transformers>=5.0.0
+transformers>=4.56.0
+torch>=2.2
+huggingface-hub>=0.34

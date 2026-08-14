@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "runbook-rag"
+version = "0.1.0"
+description = "Confluence runbook RAG: structural chunking + Gemma embeddings + hybrid retrieval"
+requires-python = ">=3.10"
+
+[project.scripts]
+triage = "triage.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
