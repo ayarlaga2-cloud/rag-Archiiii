@@ -55,57 +55,71 @@ confluence:
 embedding:
   active: gemma
 
-  # --- credentials used by the profiles below ---
-  # EmbeddingGemma is a GATED model. Two steps:
-  #   1. Accept the licence: https://huggingface.co/google/embeddinggemma-300m
-  #   2. Create a READ token: https://huggingface.co/settings/tokens
-  # Alternatively run `huggingface-cli login` once and leave this blank.
-  hf_token: ""
+  # Offline mode. Keep this TRUE on a corporate network: it forces the
+  # HuggingFace libraries into local-only mode before they are imported, so a
+  # blocked proxy fails fast instead of hanging on a Hub call that will never
+  # succeed. The model is loaded from the folder named in the profile below.
+  offline: true
 
-  # Only needed by the `voyage` embedding profile and the `voyage` reranker
-  # profile. https://dash.voyageai.com/api-keys
+  # Not used while offline: true. Left here for a machine that does have Hub
+  # access (e.g. a personal laptop used to download the model in the first
+  # place).
+  hf_token: ""
   voyage_api_key: ""
 
   profiles:
-    # Default. 308M params, 768 dims, 2048-token window, CPU-viable.
-    # GATED MODEL: accept the licence at
-    #   https://huggingface.co/google/embeddinggemma-300m
-    # then `huggingface-cli login`, or set `hf_token` above.
+    # ===================================================================
+    # DEFAULT — EmbeddingGemma loaded from a LOCAL FOLDER.
+    #
+    # Point `model` at the directory you copied onto this machine. It must
+    # be the folder that contains modules.json and model.safetensors, not a
+    # zip and not just the weights file.
+    #
+    #   Windows:  "C:/models/embeddinggemma-300m"
+    #             (forward slashes, or escape backslashes: "C:\\models\\...")
+    #   Linux:    "/opt/models/embeddinggemma-300m"
+    #   Relative: "./models/embeddinggemma-300m"
+    #
+    # Verify the folder is complete before a long ingest:
+    #     triage check
+    # ===================================================================
     gemma:
       provider: gemma
-      model: "google/embeddinggemma-300m"
+      model: "./models/embeddinggemma-300m"
       batch_size: 16
       truncate_dim: null    # Matryoshka: null (768) | 512 | 256 | 128
       device: ""            # "" autodetects | cpu | cuda | mps
 
-    # Same model, quarter-size index. Measure against your eval set before
-    # adopting — the accuracy cost is real but usually small.
+    # Same local folder, quarter-size index — smaller and faster to search.
+    # Measure against your eval set before adopting; the accuracy cost is
+    # real but usually small.
     gemma-256:
       provider: gemma
-      model: "google/embeddinggemma-300m"
+      model: "./models/embeddinggemma-300m"
       batch_size: 16
       truncate_dim: 256
       device: ""
 
-    # Lighter alternative, no gated-model login required. 384 dims.
-    bge-small:
+    # Any other sentence-transformers model you have on disk.
+    local-st:
       provider: sentence-transformers
-      model: "BAAI/bge-small-en-v1.5"
+      model: "./models/bge-small-en-v1.5"
       batch_size: 32
       device: ""
 
-    # Hosted API — no local model, no torch install.
-    voyage:
-      provider: voyage
-      model: "voyage-3"      # key: embedding.voyage_api_key above
-      batch_size: 64
-
-    # Dependency-free. Runs the whole pipeline on numpy alone so you can
-    # verify wiring before downloading 2 GB. Retrieval quality is poor —
-    # smoke tests only, never ship it.
+    # Dependency-free. Runs the whole pipeline on numpy alone, so you can
+    # verify Confluence auth, chunking and retrieval wiring before the model
+    # folder is even in place. Retrieval quality is poor — never ship it.
     hashing:
       provider: hashing
       model: "hashing-384"
+
+    # BLOCKED on the corporate network — hosted API, kept only so the code
+    # path stays exercised if this ever runs somewhere with egress.
+    voyage:
+      provider: voyage
+      model: "voyage-3"
+      batch_size: 64
 
 # ---------------------------------------------------------------------------
 # Vector store — `local` to start, `production` when you outgrow it
@@ -143,6 +157,27 @@ chunking:
   # ~12% of max. Structural boundaries already fall in sensible places, so
   # heavy overlap mostly buys duplicate storage.
   overlap_tokens: 64
+
+# ---------------------------------------------------------------------------
+# Ingest — these matter once the corpus is large
+# ---------------------------------------------------------------------------
+ingest:
+  # auto   -> SQLite FTS5 (on-disk, incremental, scales to millions of chunks)
+  # json   -> in-memory BM25 sidecar; loads the whole index at startup, so it
+  #           only suits small corpora. Use if FTS5 is missing from SQLite.
+  lexical_backend: auto
+
+  # Record every completed page, so an interrupted run resumes instead of
+  # re-embedding from scratch. On a corpus this size that is the difference
+  # between losing minutes and losing hours.
+  checkpoint: true
+
+  # Log progress (rate, %, ETA) every N pages.
+  progress_every: 25
+
+  # Pages fetched and normalized ahead of the embedder, so HTTP latency hides
+  # behind CPU work. Raise for a slow/distant Confluence; 0 disables.
+  prefetch: 8
 
 # ---------------------------------------------------------------------------
 # Retrieval

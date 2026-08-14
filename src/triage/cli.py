@@ -132,9 +132,36 @@ def check(
     table.add_row("vector_store", settings.vector_store_profile, f"{settings.vector_backend} / {settings.vector_collection}")
     table.add_row("reranker", settings.reranker_profile, settings.reranker_provider)
     console.print(table)
-    console.print(f"[dim]config: {settings.config_file or '(defaults only)'}[/]")
+    console.print(
+        f"[dim]config: {settings.config_file or '(defaults only)'}  |  "
+        f"offline: {settings.embedding_offline}  |  "
+        f"lexical: {settings.lexical_backend}[/]"
+    )
 
     ok = True
+
+    # Validate the model folder before loading anything — a wrong path is the
+    # most common failure on an offline machine, and it should report in
+    # milliseconds rather than after a long import.
+    if settings.embedding_provider in {"gemma", "sentence-transformers"}:
+        from triage.embeddings._offline import looks_like_path
+
+        if looks_like_path(settings.embedding_model):
+            from triage.embeddings._offline import resolve_model_path
+
+            try:
+                path = resolve_model_path(settings.embedding_model)
+                console.print(f"[green]OK[/] Model folder [bold]{path}[/]")
+            except Exception as exc:
+                ok = False
+                console.print(f"[red]FAIL[/] Model folder:\n{exc}")
+                skip_model = True  # no point trying to load it
+        elif settings.embedding_offline:
+            console.print(
+                f"[yellow]WARN[/] `{settings.embedding_model}` looks like a "
+                "HuggingFace repo id, but offline mode is on. Point "
+                "`embedding.profiles.<active>.model` at the local model folder."
+            )
 
     if settings.confluence_configured:
         from triage.ingest.confluence import ConfluenceClient
@@ -260,13 +287,30 @@ def preview(
 def ingest_confluence(
     force: bool = typer.Option(False, help="Re-embed pages even if unchanged."),
     limit: int = typer.Option(0, help="Stop after N pages (for a trial run)."),
+    resume: bool = typer.Option(
+        True,
+        help="Resume from the checkpoint. --no-resume re-derives progress from "
+        "the store instead (slower start; unchanged pages are still skipped).",
+    ),
 ) -> None:
-    """Fetch runbooks from Confluence, chunk, embed and index them."""
+    """Fetch runbooks from Confluence, chunk, embed and index them.
+
+    Safe to interrupt with Ctrl-C on a large corpus: every completed page is
+    checkpointed, so re-running continues instead of starting over.
+    """
     from triage.app import build_stack
 
     stack = build_stack()
     try:
-        report = stack.pipeline.run_confluence(force=force, limit=limit or None)
+        report = stack.pipeline.run_confluence(
+            force=force, limit=limit or None, resume=resume
+        )
+    except KeyboardInterrupt:
+        console.print(
+            "\n[yellow]Interrupted.[/] Completed pages are checkpointed — "
+            "re-run the same command to continue from here."
+        )
+        raise typer.Exit(130)
     finally:
         stack.close()
     console.print_json(json.dumps(report.as_dict()))
@@ -278,13 +322,19 @@ def ingest_confluence(
 def ingest_local(
     directory: Path = typer.Argument(..., help="Directory of .md runbooks."),
     force: bool = typer.Option(False, help="Re-embed even if unchanged."),
+    resume: bool = typer.Option(True, help="Resume from the checkpoint."),
 ) -> None:
     """Ingest a folder of Markdown files — useful before Confluence is wired up."""
     from triage.app import build_stack
 
     stack = build_stack()
     try:
-        report = stack.pipeline.run_local_markdown(directory, force=force)
+        report = stack.pipeline.run_local_markdown(
+            directory, force=force, resume=resume
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/] Re-run to continue.")
+        raise typer.Exit(130)
     finally:
         stack.close()
     console.print_json(json.dumps(report.as_dict()))
@@ -407,39 +457,71 @@ def search(
 # stats / inspect / reset
 # ---------------------------------------------------------------------------
 @app.command()
-def stats() -> None:
-    """Index size, page count and lexical-index health."""
+def stats(
+    pages: bool = typer.Option(
+        False,
+        "--pages",
+        help="List per-page chunk counts. Scans the whole collection — slow on "
+        "a large corpus.",
+    ),
+) -> None:
+    """Index size, lexical-index health and checkpoint progress."""
     from triage.app import build_stack
+    from triage.ingest.pipeline import IngestCheckpoint
 
     stack = build_stack()
+    settings = stack.settings
     try:
-        states = stack.store.page_states()
         total = stack.store.count()
         console.print(f"[bold]Store:[/] {stack.store.name}")
-        console.print(f"[bold]Embedder:[/] {stack.embedder.name} ({stack.embedder.dimension} dims)")
+        console.print(
+            f"[bold]Embedder:[/] {stack.embedder.name} ({stack.embedder.dimension} dims)"
+        )
         console.print(f"[bold]Chunks:[/] {total}")
-        console.print(f"[bold]Pages:[/] {len(states)}")
 
-        lexical_path = stack.settings.lexical_index_path
-        if hasattr(stack.store, "lexical_search"):
-            console.print("[bold]Lexical:[/] native (Postgres full-text)")
-        elif lexical_path.exists():
-            from triage.retrieval.bm25 import BM25Index
-
-            index = BM25Index.load(lexical_path)
-            status = "[green]in sync[/]" if index.size == total else "[yellow]STALE — run `triage ingest reindex-lexical`[/]"
-            console.print(f"[bold]Lexical:[/] BM25, {index.size} docs {status}")
+        # Page count comes from the checkpoint when possible: asking the store
+        # means scanning every chunk, which is minutes on a large collection.
+        checkpoint = IngestCheckpoint(settings.checkpoint_path, enabled=True)
+        recorded = checkpoint.load()
+        if recorded:
+            console.print(
+                f"[bold]Pages:[/] {len(recorded)} [dim](from checkpoint)[/]"
+            )
         else:
-            console.print("[bold]Lexical:[/] [yellow]missing — dense-only retrieval[/]")
+            console.print("[bold]Pages:[/] [dim]no checkpoint — run `stats --pages` to scan[/]")
 
-        if states:
-            table = Table(title="Pages")
+        if hasattr(stack.store, "lexical_search"):
+            console.print("[bold]Lexical:[/] native Postgres full-text")
+        elif stack.lexical is not None:
+            size = stack.lexical.size
+            backend = type(stack.lexical).__name__
+            if size == total:
+                status = "[green]in sync[/]"
+            else:
+                status = (
+                    f"[yellow]out of sync with {total} chunks — "
+                    f"run `triage ingest reindex-lexical`[/]"
+                )
+            console.print(f"[bold]Lexical:[/] {backend}, {size} docs {status}")
+        else:
+            console.print(
+                "[bold]Lexical:[/] [yellow]missing — dense-only retrieval, "
+                "exact identifiers will be missed[/]"
+            )
+
+        if pages:
+            states = stack.store.page_states()
+            table = Table(title=f"Pages ({len(states)})")
             table.add_column("page_id")
             table.add_column("version", justify="right")
             table.add_column("chunks", justify="right")
             for state in sorted(states.values(), key=lambda s: -s.chunk_count)[:40]:
-                table.add_row(state.page_id, str(state.page_version), str(state.chunk_count))
+                table.add_row(
+                    state.page_id, str(state.page_version), str(state.chunk_count)
+                )
             console.print(table)
+            if len(states) > 40:
+                console.print(f"[dim]... and {len(states) - 40} more[/]")
     finally:
         stack.close()
 
@@ -453,15 +535,14 @@ def inspect(
 
     stack = build_stack()
     try:
-        chunks = [c for c in stack.store.iter_chunks() if c.page_id == page_id]
+        # Store-side filter, not a full scan.
+        chunks = stack.store.get_page(page_id)
     finally:
         stack.close()
 
     if not chunks:
         console.print(f"[yellow]No chunks for page {page_id}.[/]")
         raise typer.Exit(1)
-
-    chunks.sort(key=lambda c: (c.section_index, c.chunk_index))
     console.print(f"[bold]{chunks[0].page_title}[/] — {len(chunks)} chunks")
     for chunk in chunks:
         console.print(
@@ -477,21 +558,46 @@ def inspect(
 def reset(
     yes: bool = typer.Option(False, "--yes", help="Confirm deletion."),
 ) -> None:
-    """Drop the collection and the lexical index. Destructive."""
+    """Drop the collection, the lexical index and the ingest checkpoint.
+
+    Destructive: the next ingest re-embeds the entire corpus from scratch.
+    """
     if not yes:
-        console.print("[red]Refusing to delete without --yes[/]")
+        console.print(
+            "[red]Refusing to delete without --yes[/]\n"
+            "This drops every embedding and forces a full re-ingest."
+        )
         raise typer.Exit(1)
     from triage.app import build_stack
 
     stack = build_stack()
+    settings = stack.settings
     try:
         stack.store.reset()
-        path = stack.settings.lexical_index_path
-        if path.exists():
-            path.unlink()
+        # Close the SQLite handle before unlinking, or Windows refuses.
+        if stack.lexical is not None:
+            closer = getattr(stack.lexical, "close", None)
+            if callable(closer):
+                closer()
+            stack.lexical = None
+        for path in (
+            settings.lexical_index_path,
+            settings.lexical_db_path,
+            settings.checkpoint_path,
+        ):
+            if path.exists():
+                path.unlink()
+                console.print(f"[dim]removed {path.name}[/]")
+        # SQLite WAL sidecars.
+        for suffix in ("-wal", "-shm"):
+            sidecar = settings.lexical_db_path.with_name(
+                settings.lexical_db_path.name + suffix
+            )
+            if sidecar.exists():
+                sidecar.unlink()
     finally:
         stack.close()
-    console.print("[green]Index cleared.[/]")
+    console.print("[green]Index, lexical index and checkpoint cleared.[/]")
 
 
 # ---------------------------------------------------------------------------

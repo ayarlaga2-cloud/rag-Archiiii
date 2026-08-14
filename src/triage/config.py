@@ -63,6 +63,10 @@ class Settings(BaseModel):
     embedding_batch_size: int = 16
     embedding_truncate_dim: int | None = None
     embedding_device: str = ""
+    # Forces HF libraries into local-only mode. Default True: this project is
+    # built for environments where huggingface.co is blocked, and a stray Hub
+    # call there hangs until the proxy times out rather than failing fast.
+    embedding_offline: bool = True
     hf_token: str = ""
     voyage_api_key: str = ""
     voyage_embedding_model: str = "voyage-3"
@@ -79,6 +83,14 @@ class Settings(BaseModel):
     chunk_max_tokens: int = 512
     chunk_min_tokens: int = 96
     chunk_overlap_tokens: int = 64
+
+    # --- Ingest (scale) ----------------------------------------------------
+    # auto -> SQLite FTS5 when available (scales, incremental)
+    # json -> in-memory BM25 sidecar (small corpora only)
+    lexical_backend: Literal["auto", "sqlite", "json"] = "auto"
+    ingest_checkpoint: bool = True
+    ingest_progress_every: int = 25
+    ingest_prefetch: int = 8
 
     # --- Retrieval ---------------------------------------------------------
     retrieval_dense_k: int = 30
@@ -131,7 +143,18 @@ class Settings(BaseModel):
     # --- Derived -----------------------------------------------------------
     @property
     def lexical_index_path(self) -> Path:
+        """JSON BM25 sidecar (legacy/small-corpus backend)."""
         return self.data_dir / f"lexical_{self.vector_collection}.json"
+
+    @property
+    def lexical_db_path(self) -> Path:
+        """SQLite FTS5 index (default backend)."""
+        return self.data_dir / f"lexical_{self.vector_collection}.db"
+
+    @property
+    def checkpoint_path(self) -> Path:
+        """Completed-page log, so an interrupted ingest resumes instantly."""
+        return self.data_dir / f"ingest_{self.vector_collection}.checkpoint.jsonl"
 
     @property
     def confluence_configured(self) -> bool:
@@ -170,6 +193,13 @@ class Settings(BaseModel):
                 "batch_size": self.embedding_batch_size,
                 "truncate_dim": self.embedding_truncate_dim or "full",
                 "device": self.embedding_device or "auto",
+                "offline": self.embedding_offline,
+            },
+            "ingest": {
+                "lexical_backend": self.lexical_backend,
+                "checkpoint": self.ingest_checkpoint,
+                "progress_every": self.ingest_progress_every,
+                "prefetch": self.ingest_prefetch,
             },
             "vector_store": {
                 "profile": self.vector_store_profile,
@@ -386,6 +416,7 @@ def load_settings(
 
     confluence = _section(data, "confluence")
     chunking = _section(data, "chunking")
+    ingest = _section(data, "ingest")
     retrieval = _section(data, "retrieval")
     service = _section(data, "service")
     logging_cfg = _section(data, "logging")
@@ -437,6 +468,9 @@ def load_settings(
         embedding_batch_size=_env_int("EMBEDDING_BATCH_SIZE", int(emb.get("batch_size", 16))),
         embedding_truncate_dim=truncate_dim,
         embedding_device=_env_str("EMBEDDING_DEVICE", str(emb.get("device", "") or "")),
+        embedding_offline=_env_bool(
+            "EMBEDDING_OFFLINE", bool(embedding_section.get("offline", True))
+        ),
         hf_token=_env_str("HF_TOKEN", str(embedding_section.get("hf_token", "") or "")),
         voyage_api_key=_env_str(
             "VOYAGE_API_KEY", str(embedding_section.get("voyage_api_key", "") or "")
@@ -457,6 +491,13 @@ def load_settings(
         chunk_overlap_tokens=_env_int(
             "CHUNK_OVERLAP_TOKENS", int(chunking.get("overlap_tokens", 64))
         ),
+        # Ingest / scale
+        lexical_backend=_env_str("LEXICAL_BACKEND", str(ingest.get("lexical_backend", "auto"))),
+        ingest_checkpoint=_env_bool("INGEST_CHECKPOINT", bool(ingest.get("checkpoint", True))),
+        ingest_progress_every=_env_int(
+            "INGEST_PROGRESS_EVERY", int(ingest.get("progress_every", 25))
+        ),
+        ingest_prefetch=_env_int("INGEST_PREFETCH", int(ingest.get("prefetch", 8))),
         # Retrieval
         retrieval_dense_k=_env_int("RETRIEVAL_DENSE_K", int(retrieval.get("dense_k", 30))),
         retrieval_lexical_k=_env_int("RETRIEVAL_LEXICAL_K", int(retrieval.get("lexical_k", 30))),

@@ -33,19 +33,41 @@ class LocalEmbedder:
         model_name: str = "BAAI/bge-small-en-v1.5",
         batch_size: int = 32,
         device: str = "",
+        offline: bool = True,
     ) -> None:
+        from triage.embeddings._offline import (
+            enable_offline_mode,
+            looks_like_path,
+            resolve_model_path,
+        )
+
+        # Before importing sentence_transformers — the HF libraries read the
+        # offline env vars at import time.
+        if offline:
+            enable_offline_mode()
+
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:  # pragma: no cover - env dependent
             raise ImportError(
                 "sentence-transformers is not installed.\n"
                 "  pip install -r requirements-embeddings.txt\n"
-                "Or switch providers: EMBEDDING_PROVIDER=voyage (hosted) or "
-                "EMBEDDING_PROVIDER=hashing (offline smoke tests)."
+                "Or switch to the `hashing` profile for offline smoke tests."
             ) from exc
 
-        log.info("embedder.loading", model=model_name)
-        self._model = SentenceTransformer(model_name, **({"device": device} if device else {}))
+        source = str(resolve_model_path(model_name)) if looks_like_path(model_name) else model_name
+        kwargs: dict = {}
+        if device:
+            kwargs["device"] = device
+        if offline:
+            kwargs["local_files_only"] = True
+
+        log.info("embedder.loading", model=source, offline=offline)
+        try:
+            self._model = SentenceTransformer(source, **kwargs)
+        except TypeError:
+            kwargs.pop("local_files_only", None)
+            self._model = SentenceTransformer(source, **kwargs)
         self._model_name = model_name
         self._batch_size = batch_size
         self._dimension = int(self._model.get_sentence_embedding_dimension())

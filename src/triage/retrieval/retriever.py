@@ -78,7 +78,7 @@ class HybridRetriever:
         embedder: Embedder,
         store: VectorStore,
         reranker: Reranker | None = None,
-        lexical_index: BM25Index | None = None,
+        lexical_index=None,
     ) -> None:
         self.settings = settings
         self.embedder = embedder
@@ -86,32 +86,51 @@ class HybridRetriever:
         self.reranker = reranker if reranker is not None else build_reranker(settings)
         self._lexical = lexical_index
         self._lexical_loaded = lexical_index is not None
-        # pgvector does full-text search in the database; only Chroma needs the
-        # in-process BM25 sidecar.
+        # pgvector does full-text search in the database; only Chroma needs a
+        # separate lexical index alongside it.
         self._native_lexical = hasattr(store, "lexical_search")
 
     # -- lexical index -----------------------------------------------------
     @property
-    def lexical(self) -> BM25Index | None:
+    def lexical(self):
+        """SQLite FTS5 index, or the legacy JSON BM25 sidecar."""
         if self._native_lexical:
             return None
         if not self._lexical_loaded:
-            path = self.settings.lexical_index_path
-            if path.exists():
-                try:
-                    self._lexical = BM25Index.load(path)
-                    log.debug("retriever.lexical_loaded", size=self._lexical.size)
-                except Exception as exc:
-                    log.warning("retriever.lexical_load_failed", error=str(exc))
-                    self._lexical = None
-            else:
-                log.warning(
-                    "retriever.lexical_missing",
-                    path=str(path),
-                    detail="Falling back to dense-only. Run `ingest` to build it.",
-                )
             self._lexical_loaded = True
+            self._lexical = self._open_lexical()
         return self._lexical
+
+    def _open_lexical(self):
+        settings = self.settings
+
+        # Preferred: the on-disk FTS5 index. Opening it is constant-time
+        # regardless of corpus size, unlike deserializing the JSON sidecar.
+        if settings.lexical_backend != "json" and settings.lexical_db_path.exists():
+            try:
+                from triage.retrieval.sqlite_lexical import SQLiteLexicalIndex
+
+                index = SQLiteLexicalIndex(settings.lexical_db_path)
+                log.debug("retriever.lexical_loaded", backend="fts5", size=index.size)
+                return index
+            except Exception as exc:
+                log.warning("retriever.lexical_open_failed", backend="fts5", error=str(exc))
+
+        if settings.lexical_index_path.exists():
+            try:
+                index = BM25Index.load(settings.lexical_index_path)
+                log.debug("retriever.lexical_loaded", backend="json", size=index.size)
+                return index
+            except Exception as exc:
+                log.warning("retriever.lexical_open_failed", backend="json", error=str(exc))
+
+        log.warning(
+            "retriever.lexical_missing",
+            detail="No lexical index found — falling back to dense-only "
+            "retrieval, which will miss exact identifiers. Run `triage ingest` "
+            "or `triage ingest reindex-lexical`.",
+        )
+        return None
 
     # -- search ------------------------------------------------------------
     def search(
@@ -166,11 +185,19 @@ class HybridRetriever:
                 "final": len(reranked),
                 "expanded": len(expanded),
                 "reranker": self.reranker.name,
-                "lexical_backend": "native" if self._native_lexical else "bm25",
+                "lexical_backend": self._lexical_backend_name(),
             },
         )
         log.info("retriever.search", query=query[:120], **result.stats, took_ms=round(took, 1))
         return result
+
+    def _lexical_backend_name(self) -> str:
+        if self._native_lexical:
+            return "postgres-fts"
+        index = self.lexical
+        if index is None:
+            return "none"
+        return "fts5" if type(index).__name__ == "SQLiteLexicalIndex" else "bm25-json"
 
     # -- stages ------------------------------------------------------------
     def _dense(

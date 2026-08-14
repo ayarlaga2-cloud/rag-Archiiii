@@ -136,6 +136,22 @@ class ConfluenceClient:
         """Cheap authenticated call — use to validate credentials up front."""
         return self._get("/rest/api/user/current")
 
+    def count_pages(self, cql: str | None = None) -> int | None:
+        """Total pages matching the CQL, for progress reporting.
+
+        Cheap: asks for a single result and reads the total off the envelope.
+        Confluence does not always populate `totalSize`, so this returns None
+        rather than guessing — progress then reports rate without an ETA.
+        """
+        query = cql or self.settings.effective_cql()
+        payload = self._get(
+            "/rest/api/content/search", params={"cql": query, "limit": 1}
+        )
+        total = payload.get("totalSize")
+        if total is None:
+            total = payload.get("size")
+        return int(total) if isinstance(total, int) else None
+
     def search_pages(self, cql: str | None = None) -> Iterator[ConfluencePage]:
         """Yield every page matching the CQL query, following pagination."""
         query = cql or self.settings.effective_cql()

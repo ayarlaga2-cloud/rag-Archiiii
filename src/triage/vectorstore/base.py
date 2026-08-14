@@ -53,6 +53,13 @@ class VectorStore(Protocol):
     def get_section(self, page_id: str, section_index: int) -> list[Chunk]:
         """All chunks of one section, in order — used for section expansion."""
 
+    def get_page(self, page_id: str) -> list[Chunk]:
+        """All chunks of one page, in order.
+
+        Must filter in the store, not by scanning every chunk — on a large
+        corpus the difference is milliseconds versus minutes.
+        """
+
     def count(self) -> int:
         ...
 

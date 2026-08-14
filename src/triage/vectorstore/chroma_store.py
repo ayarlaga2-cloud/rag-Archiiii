@@ -195,6 +195,21 @@ class ChromaVectorStore:
         ]
         return sorted(chunks, key=lambda c: c.chunk_index)
 
+    def get_page(self, page_id: str) -> list[Chunk]:
+        collection = self._require()
+        result = collection.get(
+            where={"page_id": {"$eq": page_id}}, include=["documents", "metadatas"]
+        )
+        chunks = [
+            Chunk.from_metadata(cid, meta or {}, doc or "")
+            for cid, doc, meta in zip(
+                result.get("ids") or [],
+                result.get("documents") or [],
+                result.get("metadatas") or [],
+            )
+        ]
+        return sorted(chunks, key=lambda c: (c.section_index, c.chunk_index))
+
     def iter_chunks(self) -> Iterator[Chunk]:
         collection = self._require()
         offset = 0

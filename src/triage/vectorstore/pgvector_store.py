@@ -304,6 +304,16 @@ class PgVectorStore:
             rows = cur.fetchall()
         return [_row_to_chunk(r) for r in rows]
 
+    def get_page(self, page_id: str) -> list[Chunk]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_COLUMNS} FROM {self._table} WHERE page_id = %s "
+                f"ORDER BY section_index, chunk_index",
+                (page_id,),
+            )
+            rows = cur.fetchall()
+        return [_row_to_chunk(r) for r in rows]
+
     def iter_chunks(self) -> Iterator[Chunk]:
         with self._conn.cursor(name="chunk_cursor") as cur:
             cur.execute(f"SELECT {_COLUMNS} FROM {self._table}")

@@ -16,6 +16,7 @@ def build_embedder(settings: Settings) -> Embedder:
             truncate_dim=settings.embedding_truncate_dim,
             device=settings.embedding_device,
             hf_token=settings.hf_token,
+            offline=settings.embedding_offline,
         )
 
     if provider == "sentence-transformers":
@@ -25,6 +26,7 @@ def build_embedder(settings: Settings) -> Embedder:
             model_name=settings.embedding_model,
             batch_size=settings.embedding_batch_size,
             device=settings.embedding_device,
+            offline=settings.embedding_offline,
         )
 
     if provider == "voyage":

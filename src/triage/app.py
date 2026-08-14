@@ -29,9 +29,10 @@ class Stack:
     chunker: RunbookChunker
     retriever: HybridRetriever
     pipeline: IngestPipeline
+    lexical: object | None = None
 
     def close(self) -> None:
-        for component in (self.store, self.embedder):
+        for component in (self.lexical, self.store, self.embedder):
             closer = getattr(component, "close", None)
             if callable(closer):
                 try:
@@ -58,14 +59,28 @@ def build_stack(settings: Settings | None = None, configure_logs: bool = True) -
         # CHUNK_MAX_TOKENS means Gemma tokens rather than a guess.
         token_counter=getattr(embedder, "count_tokens", None),
     )
-    pipeline = IngestPipeline(settings, embedder, store, chunker)
-    retriever = HybridRetriever(settings, embedder, store)
+    # One lexical index shared by ingest and retrieval. Two SQLite handles on
+    # the same file would work, but sharing keeps writes visible to reads
+    # immediately and halves the open connections.
+    lexical = None
+    if not hasattr(store, "lexical_search"):
+        from triage.retrieval.sqlite_lexical import build_lexical_index
+
+        lexical = build_lexical_index(
+            settings.data_dir,
+            settings.vector_collection,
+            prefer_sqlite=settings.lexical_backend != "json",
+        )
+
+    pipeline = IngestPipeline(settings, embedder, store, chunker, lexical=lexical)
+    retriever = HybridRetriever(settings, embedder, store, lexical_index=lexical)
 
     log.info(
         "stack.ready",
         embedder=embedder.name,
         dimension=embedder.dimension,
         store=store.name,
+        lexical=type(lexical).__name__ if lexical else "native",
         chunk_max_tokens=settings.chunk_max_tokens,
     )
     return Stack(
@@ -75,4 +90,5 @@ def build_stack(settings: Settings | None = None, configure_logs: bool = True) -
         chunker=chunker,
         retriever=retriever,
         pipeline=pipeline,
+        lexical=lexical,
     )

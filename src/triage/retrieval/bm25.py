@@ -46,24 +46,55 @@ _STOPWORDS = frozenset(
 _KEEP_SHORT = frozenset({"oom", "cpu", "gc", "io", "ssl", "tls", "dns", "5xx", "4xx"})
 
 
+def _keep(token: str) -> bool:
+    """Single length rule for every emission route.
+
+    Two chars is the floor: `503`, `gc`, `io` carry meaning in ops text, a lone
+    `5` or `a` does not. `_KEEP_SHORT` is the escape hatch for anything below.
+    """
+    if not token or token in _STOPWORDS:
+        return False
+    return len(token) > 1 or token in _KEEP_SHORT
+
+
 def tokenize(text: str) -> list[str]:
     tokens: list[str] = []
+
     for raw in _WORD_RE.findall(text):
+        # Per-raw dedupe: the same surface form reached by two routes below
+        # would otherwise inflate its term frequency and skew BM25.
+        emitted: set[str] = set()
+
+        def add(token: str) -> None:
+            if _keep(token) and token not in emitted:
+                emitted.add(token)
+                tokens.append(token)
+
+        low_raw = raw.lower().strip("./:-_")
+        if not low_raw:
+            continue
+
+        # 1. The whole surface form: `org.postgresql.util.psqlexception`.
+        add(low_raw)
+
+        # 2. Separator-split, WITHOUT camel splitting. This is what makes
+        #    `psqlexception` findable — a user reading `PSQLException` out of a
+        #    log types it lowercased and unsplit, and would otherwise match
+        #    nothing, because step 3 only ever emits `psql` + `exception`.
+        for piece in _SPLIT_RE.split(low_raw):
+            add(piece)
+
+        # 3. camelCase / ACRONYMWord split, plus the separator-split of each
+        #    part: `NullPointerException` -> null, pointer, exception.
         expanded = _CAMEL_2.sub(" ", _CAMEL_1.sub(" ", raw))
         for part in expanded.split():
             low = part.lower().strip("./:-_")
             if not low:
                 continue
-            if low not in _STOPWORDS and (len(low) > 1 or low.isdigit()):
-                tokens.append(low)
-            # Sub-tokens: a fully-qualified class name should also match its
-            # bare form.
-            pieces = [p for p in _SPLIT_RE.split(low) if p]
-            if len(pieces) > 1:
-                tokens.extend(
-                    p for p in pieces
-                    if p not in _STOPWORDS and (len(p) > 2 or p in _KEEP_SHORT or p.isdigit())
-                )
+            add(low)
+            for piece in _SPLIT_RE.split(low):
+                add(piece)
+
     return tokens
 
 

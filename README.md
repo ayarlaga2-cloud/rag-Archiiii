@@ -66,22 +66,58 @@ pip install -e .
 copy config.example.yaml config.yaml
 ```
 
-Verify the pipeline **before** downloading a 2 GB model — the `hashing` profile
-runs the full path on numpy alone:
+Verify the pipeline **before** wiring up the model — the `hashing` profile runs
+the full path on numpy alone:
 
 ```bash
 triage --embedding-profile hashing ingest local samples/runbooks
 triage --embedding-profile hashing search "postgres connection pool exhausted"
 ```
 
-Then switch to the real embedder:
+Then point it at your local model folder (see below) and:
 
 ```bash
 pip install -r requirements-embeddings.txt
-huggingface-cli login          # EmbeddingGemma is a gated model
 triage config                  # confirm what resolved
-triage check                   # auth + CQL + model + store
+triage check                   # model folder + Confluence auth + store
 ```
+
+## Running fully offline
+
+This build never contacts huggingface.co. On a corporate network the Hub is
+typically blocked, and a stray Hub call does not fail fast — it hangs until the
+proxy times out. So `embedding.offline: true` (the default) forces the HF
+libraries into local-only mode **before** they are imported, which is the only
+point at which those env vars are read.
+
+Copy the EmbeddingGemma folder onto the machine and point at it:
+
+```yaml
+embedding:
+  offline: true
+  active: gemma
+  profiles:
+    gemma:
+      provider: gemma
+      model: "C:/models/embeddinggemma-300m"   # forward slashes on Windows
+```
+
+It must be the folder containing `modules.json` and `model.safetensors` — not a
+zip, and not just the weights file. `triage check` validates this in
+milliseconds before anything slow happens:
+
+```
+OK  Model folder C:\models\embeddinggemma-300m
+```
+
+If `modules.json` is missing, you get a loud warning rather than silence.
+sentence-transformers would otherwise load the weights and apply **default mean
+pooling**, which is not EmbeddingGemma's head — every vector would be quietly
+degraded with no error raised. That is the one failure mode here worth knowing
+about.
+
+Voyage and any other hosted provider are unreachable on this network. Their
+profiles remain in `config.yaml` but are not selectable in practice.
 
 ## Connecting Confluence
 
@@ -111,6 +147,51 @@ triage ingest confluence            # full sync
 Ingest is **incremental** — a page is re-embedded only when its Confluence
 version or its normalized-content hash changed. Re-running is cheap.
 
+## Large corpora
+
+A big Confluence export means an ingest measured in hours, where the failure
+modes are operational rather than algorithmic. Four things address that:
+
+**Resumable.** Every completed page is appended to a checkpoint file, so
+Ctrl-C, a dropped VPN or a laptop sleeping does not cost you the run:
+
+```bash
+triage ingest confluence        # interrupt any time
+triage ingest confluence        # continues from the last completed page
+```
+
+Embedding is the expensive step. Losing an hour of it to a network blip is the
+single most likely way this wastes a day.
+
+**Constant startup.** Asking the vector store "which pages do I already have?"
+means scanning every chunk — minutes on a large collection, before the first
+page is even fetched. The checkpoint answers the same question instantly and
+falls back to a store scan only when absent. Watch for `known_from=checkpoint`
+in the log.
+
+**Scalable lexical index.** The lexical half of hybrid retrieval uses **SQLite
+FTS5** — on disk, memory-mapped, with a native `bm25()` ranking function, and
+updated per page rather than rebuilt. It needs no extra dependency; FTS5 is
+compiled into the `sqlite3` module that ships with Python. The old JSON BM25
+sidecar deserialized the entire postings table at every startup and rebuilt
+wholesale on any change, which does not survive a large corpus. Set
+`ingest.lexical_backend: json` only if your SQLite lacks FTS5.
+
+**Progress and ETA.** Logged every `ingest.progress_every` pages:
+
+```
+ingest.progress  seen=1250 ingested=1180 skipped=64 failed=6 chunks=9840
+                 pages_per_sec=2.1 percent=41.7 eta_min=58.3
+```
+
+Individual page failures are recorded and the run continues — one malformed
+page never ends a multi-hour ingest. The summary reports `failures_total` and
+shows the first 20.
+
+Past roughly a few hundred thousand chunks, move to the `production` profile:
+Postgres gives you concurrent writers, real backups, and native full-text
+search that replaces the FTS5 sidecar entirely.
+
 ## Testing retrieval
 
 ```bash
@@ -120,7 +201,8 @@ triage search "how do I roll back" --kind rollback # intent-scoped
 triage search "..." --json                          # machine-readable
 
 triage config                   # resolved settings, secrets masked
-triage stats                    # index size, page list, lexical health
+triage stats                    # index size, lexical health, checkpoint progress
+triage stats --pages            # per-page counts (scans the collection)
 triage inspect <page-id>        # every chunk of one page, in order
 triage preview runbook.md       # chunking only — no model, no network
 triage eval evalset/golden.jsonl
@@ -146,10 +228,10 @@ query → build_queries ──┤               ├── RRF ── rerank ─�
 
 | Layer | Local | Production | Switch by |
 |---|---|---|---|
-| Embeddings | EmbeddingGemma (CPU) | same, or Voyage | `embedding.active` |
+| Embeddings | EmbeddingGemma, local folder | same | `embedding.active` |
 | Vector store | Chroma (on disk) | Postgres + pgvector | `vector_store.active` |
-| Lexical | BM25 sidecar (JSON) | Postgres full-text | automatic |
-| Rerank | off | cross-encoder / Voyage | `reranker.active` |
+| Lexical | SQLite FTS5 | Postgres full-text | automatic |
+| Rerank | off | local cross-encoder | `reranker.active` |
 
 Nothing above the store layer knows which backend it is talking to, so the
 production move is a config change. The `production` profile additionally moves
@@ -193,19 +275,21 @@ procedures whole; carry the heading path into the embedded text.**
 
 ## EmbeddingGemma notes
 
-`google/embeddinggemma-300m`: 308M params, 768 dims, 2048-token window, CPU-viable.
+308M params, 768 dims, 2048-token window, CPU-viable.
 
 It is **asymmetric and prompt-driven** — queries and documents take different
-task prefixes, and omitting them is a quiet, significant recall loss. This is
-handled in [`embeddings/gemma.py`](src/triage/embeddings/gemma.py) via
-`encode_query()` / `encode_document()`.
+task prefixes (`task: search result | query:` vs `title: … | text:`), and
+omitting them is a quiet, significant recall loss. Handled in
+[`embeddings/gemma.py`](src/triage/embeddings/gemma.py) via `encode_query()` /
+`encode_document()`, with a literal-prefix fallback for older
+sentence-transformers.
 
 It is Matryoshka-trained, so the `gemma-256` profile shrinks the index with a
 small accuracy cost and no retraining — worth measuring against your eval set
 once the corpus is real.
 
-It is a **gated** model: accept the licence on HuggingFace, then either run
-`huggingface-cli login` or set `embedding.hf_token` in `config.yaml`.
+Chunks are sized with **Gemma's own tokenizer**, so `chunking.max_tokens` means
+real Gemma tokens rather than an estimate.
 
 ## Tuning order
 
@@ -239,16 +323,17 @@ src/triage/
   ingest/              confluence · normalize · chunker · pipeline
   embeddings/          gemma · local(ST) · voyage · hashing
   vectorstore/         chroma · pgvector  (one protocol)
-  retrieval/           bm25 · fusion · rerank · query · retriever
+  embeddings/_offline.py  offline enforcement + model-folder validation
+  retrieval/           bm25 · sqlite_lexical (FTS5) · fusion · rerank · retriever
   evaluation/          recall@k · MRR · nDCG@k
   cli.py  api.py
-tests/                 96 tests, no network or model required
+tests/                 150 tests, no network or model required
 samples/runbooks/      two realistic runbooks
 evalset/golden.jsonl   starter golden set
 ```
 
 ```bash
-pytest        # 96 tests, runs offline
+pytest        # 150 tests, runs offline
 ```
 
 ## Status

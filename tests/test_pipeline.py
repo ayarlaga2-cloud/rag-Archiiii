@@ -7,6 +7,7 @@ that incremental sync actually skips unchanged pages.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Iterator
 
 import pytest
@@ -89,6 +90,10 @@ class InMemoryStore:
 
     def get_chunks(self, chunk_ids: list[str]) -> list[Chunk]:
         return [self.chunks[c] for c in chunk_ids if c in self.chunks]
+
+    def get_page(self, page_id: str) -> list[Chunk]:
+        found = [c for c in self.chunks.values() if c.page_id == page_id]
+        return sorted(found, key=lambda c: (c.section_index, c.chunk_index))
 
     def get_section(self, page_id: str, section_index: int) -> list[Chunk]:
         found = [
@@ -173,7 +178,70 @@ def test_ingest_writes_chunks_and_lexical_index(stack):
     assert report.pages_ingested == 1
     assert report.chunks_written > 0
     assert store.count() == report.chunks_written
-    assert settings.lexical_index_path.exists()
+
+    # Backend-agnostic: assert the lexical index is populated and searchable,
+    # not which file it happens to live in.
+    assert pipeline.lexical is not None
+    assert pipeline.lexical.size == report.chunks_written
+    assert pipeline.lexical.search("pgbouncer", k=5)
+
+
+def test_ingest_writes_checkpoint_for_resume(stack):
+    settings, _, _, pipeline, _ = stack
+    pipeline.ingest_documents([make_doc()])
+
+    assert settings.checkpoint_path.exists()
+    lines = [
+        l for l in settings.checkpoint_path.read_text(encoding="utf-8").splitlines() if l.strip()
+    ]
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["page_id"] == "123"
+    assert row["chunks"] > 0
+
+
+def test_resume_skips_pages_using_checkpoint_only(stack):
+    """The second run must not need to scan the store to know what is done."""
+    _, store, _, pipeline, _ = stack
+    pipeline.ingest_documents([make_doc()])
+
+    # Emptying the store leaves only the checkpoint as a source of truth. If
+    # resume works off the checkpoint, the page is still skipped.
+    store.chunks.clear()
+    store.vectors.clear()
+    second = pipeline.ingest_documents([make_doc()])
+    assert second.pages_skipped == 1
+    assert second.pages_ingested == 0
+
+
+def test_no_resume_clears_checkpoint_but_still_trusts_the_store(stack):
+    """`resume=False` and `force=True` are different levers.
+
+    resume=False discards the checkpoint and re-derives what is already indexed
+    from the store — an unchanged page is still skipped, because re-embedding it
+    would be pure waste. force=True is the flag that re-embeds regardless.
+    """
+    settings, _, _, pipeline, _ = stack
+    pipeline.ingest_documents([make_doc()])
+    assert settings.checkpoint_path.exists()
+
+    again = pipeline.ingest_documents([make_doc()], resume=False)
+    assert again.pages_skipped == 1
+    assert again.pages_ingested == 0
+
+    forced = pipeline.ingest_documents([make_doc()], force=True)
+    assert forced.pages_ingested == 1
+
+
+def test_corrupt_checkpoint_line_is_tolerated(stack):
+    settings, _, _, pipeline, _ = stack
+    pipeline.ingest_documents([make_doc()])
+    # Simulate a hard kill mid-write leaving a torn final line.
+    with settings.checkpoint_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"page_id": "trunc')
+
+    report = pipeline.ingest_documents([make_doc()])
+    assert report.pages_skipped == 1  # the intact line still applied
 
 
 def test_unchanged_page_is_skipped_on_second_run(stack):

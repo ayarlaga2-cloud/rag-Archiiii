@@ -1,16 +1,23 @@
-"""EmbeddingGemma (`google/embeddinggemma-300m`) — the default embedder.
+"""EmbeddingGemma — loaded from a local directory, fully offline.
 
 Why it fits this corpus:
 
-  * 308M params, runs on CPU; ~768-dim output, so the index stays small.
-  * 2048-token input window — comfortably larger than any chunk we produce, so
-    no chunk is ever silently truncated mid-procedure.
-  * Matryoshka-trained: the same vector can be truncated to 512/256/128 dims
-    without retraining, which is a cheap index-size lever later.
+  * 308M params, runs on CPU; 768-dim output, so the index stays small.
+  * 2048-token input window — larger than any chunk we produce, so no chunk is
+    ever silently truncated mid-procedure.
+  * Matryoshka-trained: the same vector truncates to 512/256/128 dims without
+    retraining, which is a cheap index-size lever later.
 
-The critical detail is that EmbeddingGemma is **asymmetric and prompt-driven**.
-It was trained with task prefixes, and omitting them is a quiet, significant
-recall regression — the model behaves as if it were answering a different task:
+**This build never contacts huggingface.co.** `embedding.model` is expected to
+be a filesystem path to a model folder copied onto the machine; offline mode is
+forced before the HF libraries are imported, so a blocked proxy cannot stall
+the load. A Hub repo id still works if the network happens to allow it, but
+nothing here depends on that.
+
+The critical behavioural detail is that EmbeddingGemma is **asymmetric and
+prompt-driven**. It was trained with task prefixes, and omitting them is a
+quiet, significant recall regression — the model behaves as if answering a
+different task:
 
     query    ->  "task: search result | query: {text}"
     document ->  "title: {title} | text: {text}"
@@ -19,14 +26,17 @@ sentence-transformers >= 5.0 exposes `encode_query()` / `encode_document()`,
 which apply those prefixes from the model's own config. This class uses them
 when present and falls back to the literal prefixes otherwise, so the prompts
 are applied either way.
-
-EmbeddingGemma is a GATED model. Accept the licence at
-https://huggingface.co/google/embeddinggemma-300m, then `huggingface-cli login`
-or set HF_TOKEN.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from triage.embeddings._offline import (
+    enable_offline_mode,
+    looks_like_path,
+    resolve_model_path,
+)
 from triage.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -36,14 +46,19 @@ log = get_logger(__name__)
 QUERY_PROMPT = "task: search result | query: "
 DOCUMENT_PROMPT = "title: none | text: "
 
-_GATED_HELP = (
-    "Could not load google/embeddinggemma-300m.\n"
-    "It is a gated model — three things are required:\n"
-    "  1. Accept the licence at https://huggingface.co/google/embeddinggemma-300m\n"
-    "  2. Authenticate: `huggingface-cli login`, or set HF_TOKEN in .env\n"
-    "  3. pip install -r requirements-embeddings.txt "
-    "(sentence-transformers>=5.0, transformers>=4.56)\n"
-    "To verify the rest of the pipeline first, set EMBEDDING_PROVIDER=hashing."
+_LOAD_HELP = (
+    "Could not load the EmbeddingGemma model.\n"
+    "\n"
+    "This project runs fully offline — it expects the model as a FOLDER on this\n"
+    "machine, not a download. Check, in order:\n"
+    "  1. `embedding.profiles.<active>.model` in config.yaml points at the\n"
+    "     folder containing modules.json and model.safetensors\n"
+    "  2. the whole folder was copied across, not just the weights\n"
+    "  3. pip install -r requirements-embeddings.txt\n"
+    "     (sentence-transformers>=5.0, transformers>=4.56)\n"
+    "\n"
+    "To verify the rest of the pipeline without any model at all, switch to\n"
+    "the `hashing` profile:  triage --embedding-profile hashing ingest ...\n"
 )
 
 
@@ -55,31 +70,68 @@ class GemmaEmbedder:
         truncate_dim: int | None = None,
         device: str = "",
         hf_token: str = "",
+        offline: bool = True,
     ) -> None:
+        # Must happen before sentence_transformers pulls in transformers /
+        # huggingface_hub, which read these vars at import time.
+        if offline:
+            enable_offline_mode()
+
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:  # pragma: no cover - env dependent
             raise ImportError(
                 "sentence-transformers is not installed.\n"
                 "  pip install -r requirements-embeddings.txt\n"
-                "Or set EMBEDDING_PROVIDER=hashing to smoke-test without it."
+                "Or set the `hashing` profile to smoke-test without it."
             ) from exc
+
+        is_local = looks_like_path(model_name)
+        if is_local:
+            source: str | Path = resolve_model_path(model_name)
+        else:
+            source = model_name
+            if offline:
+                log.warning(
+                    "embedder.repo_id_while_offline",
+                    model=model_name,
+                    detail=(
+                        "This looks like a Hub repo id, not a local folder. It will "
+                        "only load if the model is already in the local HF cache. "
+                        "Point `model` at the copied model folder instead."
+                    ),
+                )
 
         kwargs: dict = {}
         if truncate_dim:
             kwargs["truncate_dim"] = truncate_dim
         if device:
             kwargs["device"] = device
-        if hf_token:
+        if hf_token and not offline:
             kwargs["token"] = hf_token
+        if offline:
+            # Belt and braces: the env vars cover most paths, this covers the
+            # per-file resolution calls they miss.
+            kwargs["local_files_only"] = True
 
-        log.info("embedder.loading", model=model_name, truncate_dim=truncate_dim)
+        log.info(
+            "embedder.loading",
+            model=str(source),
+            local=is_local,
+            offline=offline,
+            truncate_dim=truncate_dim,
+        )
         try:
-            self._model = SentenceTransformer(model_name, **kwargs)
-        except Exception as exc:  # gated repo, missing auth, old transformers
-            raise RuntimeError(f"{_GATED_HELP}\n\nUnderlying error: {exc}") from exc
+            self._model = SentenceTransformer(str(source), **kwargs)
+        except TypeError:
+            # Older sentence-transformers does not accept local_files_only.
+            kwargs.pop("local_files_only", None)
+            self._model = SentenceTransformer(str(source), **kwargs)
+        except Exception as exc:
+            raise RuntimeError(f"{_LOAD_HELP}\nUnderlying error: {exc}") from exc
 
-        self._model_name = model_name
+        self._model_name = str(source)
+        self._display_name = Path(model_name).name if is_local else model_name
         self._batch_size = batch_size
         self._truncate_dim = truncate_dim
         self._dimension = truncate_dim or int(
@@ -98,7 +150,7 @@ class GemmaEmbedder:
             )
         log.info(
             "embedder.ready",
-            model=model_name,
+            model=self._display_name,
             dimension=self._dimension,
             max_seq_length=getattr(self._model, "max_seq_length", None),
         )
@@ -111,7 +163,7 @@ class GemmaEmbedder:
     @property
     def name(self) -> str:
         suffix = f"@{self._truncate_dim}" if self._truncate_dim else ""
-        return f"gemma:{self._model_name}{suffix}"
+        return f"gemma:{self._display_name}{suffix}"
 
     @property
     def max_input_tokens(self) -> int:
